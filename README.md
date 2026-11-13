@@ -9,7 +9,7 @@ schema design → INSERT/UPDATE/DELETE/.import → views → CTEs (incl. recursi
 
 ```bash
 cd ~/Desktop/SqlStuff/Learning/drills
-./reset.sh            # builds db/shop.db, db/transit.db, db/lab.db, copies ../scenario/scenario.db
+./reset.sh            # builds db/shop.db, db/transit.db, db/lab.db, unpacks the scenario DB
 ```
 Only needs `sqlite3` and `python3` (no pip packages).
 
