@@ -1,0 +1,4 @@
+# working databases are rebuilt by ./reset.sh
+db/
+__pycache__/
+*.pyc

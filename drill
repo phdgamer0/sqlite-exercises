@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""drill - reset / open / check tool for the SQL exercises in this folder.
+
+  ./drill reset  [shop|transit|lab|scenario|all]   rebuild a working DB from scratch
+  ./drill open   shop                               sqlite3 shell on db/shop.db (FKs on, box mode)
+  ./drill list   [section]                          list exercises
+  ./drill show   07.03                              print one exercise (task + hint)
+  ./drill catchup 07.03                             reset that DB and replay the official
+                                                    solutions of 07.01..07.02 (so your DB is
+                                                    in the state 07.03 expects)
+  ./drill check  07.03 my.sql                       grade your answer (use '-' for stdin)
+  ./drill solution 07.03                            print the official solution
+  ./drill build                                     (maintainer) regenerate exercises/*.md
+
+check never touches db/*.db: it grades on a throw-away copy, so a wrong answer
+can't break anything.  Your own experiments happen in db/*.db - break them freely
+and run ./drill reset.
+"""
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DBDIR = ROOT / "db"
+SCENARIO_SRC = Path(os.environ.get("SCENARIO_DB", ROOT.parent / "scenario" / "scenario.db"))
+CACHE = ROOT / "db" / ".cache"
+MAX_SHOW = 12
+
+C = {"g": "\033[32m", "r": "\033[31m", "y": "\033[33m", "b": "\033[1m", "0": "\033[0m"} \
+    if sys.stdout.isatty() else {k: "" for k in "gryb0"}
+
+
+# ------------------------------------------------------------------ loading
+def load_sections():
+    secs = []
+    for f in sorted((ROOT / "src" / "sections").glob("s[0-9][0-9]_*.py")):
+        spec = importlib.util.spec_from_file_location(f.stem, f)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        sec = dict(m.SECTION)
+        sec["file"] = f.stem
+        exs = []
+        for i, e in enumerate(m.EX, 1):
+            e = dict(e)
+            e["id"] = f"{sec['num']:02d}.{i:02d}"
+            e["db"] = e.get("db", sec["db"])
+            e.setdefault("writes", "check" in e)
+            exs.append(e)
+        sec["ex"] = exs
+        secs.append(sec)
+    return secs
+
+
+def find(eid):
+    eid = eid.strip()
+    if re.fullmatch(r"\d+\.\d+", eid):
+        a, b = eid.split(".")
+        eid = f"{int(a):02d}.{int(b):02d}"
+    for s in load_sections():
+        for e in s["ex"]:
+            if e["id"] == eid:
+                return s, e
+    sys.exit(f"no exercise {eid!r} (try ./drill list)")
+
+
+# ------------------------------------------------------------------ databases
+def build_db(name, path):
+    path = Path(path)
+    for p in (path, Path(str(path) + "-journal"), Path(str(path) + "-wal")):
+        if p.exists():
+            p.unlink()
+    if name in ("shop", "transit"):
+        key = CACHE / f"{name}.db"
+        src = ROOT / "schemas" / f"{name}.sql"
+        if not key.exists() or key.stat().st_mtime < src.stat().st_mtime:
+            CACHE.mkdir(parents=True, exist_ok=True)
+            tmp = key.with_suffix(".tmp")
+            if tmp.exists():
+                tmp.unlink()
+            con = sqlite3.connect(tmp)
+            con.executescript(src.read_text())
+            con.close()
+            tmp.replace(key)
+        shutil.copyfile(key, path)
+    elif name == "lab":
+        sqlite3.connect(path).close()
+    elif name == "scenario":
+        if not SCENARIO_SRC.exists():
+            sys.exit(f"scenario source DB not found at {SCENARIO_SRC} (set SCENARIO_DB=/path/to/scenario.db)")
+        shutil.copyfile(SCENARIO_SRC, path)
+    else:
+        sys.exit(f"unknown db {name!r}")
+
+
+def run_cli(db, script, quiet=True):
+    """Run a script through the sqlite3 shell (supports .import etc). Returns (ok, stderr)."""
+    full = ".bail on\nPRAGMA foreign_keys = ON;\n" + script + "\n"
+    p = subprocess.run(["sqlite3", str(db)], input=full, text=True, cwd=ROOT,
+                       stdout=subprocess.DEVNULL if quiet else None, stderr=subprocess.PIPE)
+    return p.returncode == 0 and not p.stderr.strip(), p.stderr.strip()
+
+
+def split_sql(script):
+    """Split into statements; dot-commands are returned as-is (flagged)."""
+    out, buf = [], ""
+    for line in script.splitlines(keepends=True):
+        if not buf.strip() and line.lstrip().startswith("."):
+            out.append(line.strip())
+            continue
+        buf += line
+        if sqlite3.complete_statement(buf):
+            if buf.strip().strip(";").strip():
+                out.append(buf.strip())
+            buf = ""
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def run_py(db, script):
+    """Execute statements with the python driver. Returns list of blocks:
+       ('rows', cols, rows)  for statements that return rows
+       ('error', msg)        for statements that fail"""
+    con = sqlite3.connect(db, isolation_level=None)
+    con.execute("PRAGMA foreign_keys = ON")
+    blocks = []
+    for st in split_sql(script):
+        if st.startswith("."):
+            raise RuntimeError(f"dot-command {st.split()[0]} not allowed here")
+        try:
+            cur = con.execute(st)
+            if cur.description:
+                cols = [d[0] for d in cur.description]
+                blocks.append(("rows", cols, cur.fetchall()))
+        except sqlite3.Error as ex:
+            blocks.append(("error", str(ex)))
+    con.close()
+    return blocks
+
+
+def prepare(sec, ex, dest):
+    """Fresh DB + replay of earlier writing solutions in the same section."""
+    build_db(ex["db"], dest)
+    chain = []
+    for e in sec["ex"]:
+        if e["id"] == ex["id"]:
+            break
+        if e.get("fresh"):
+            chain = []
+        if e["writes"] and e["db"] == ex["db"]:
+            chain.append(e)
+    if ex.get("fresh"):
+        chain = []
+    for e in chain:
+        ok, err = run_cli(dest, e["sol"])
+        if not ok:
+            raise RuntimeError(f"replaying solution {e['id']} failed: {err}")
+
+
+# ------------------------------------------------------------------ comparing
+def norm_val(v):
+    if isinstance(v, float):
+        return round(v, 2) if v != int(v) else int(v)
+    return v
+
+
+def norm_blocks(blocks, ordered):
+    out = []
+    for b in blocks:
+        if b[0] == "error":
+            out.append(("ERROR",))
+        else:
+            rows = [tuple(norm_val(v) for v in r) for r in b[2]]
+            if not ordered:
+                rows = sorted(rows, key=lambda r: [(x is None, str(type(x)), x if x is not None else 0) for x in r])
+            out.append(("rows", len(b[1]), rows))
+    return out
+
+
+def is_ordered(ex):
+    if "ordered" in ex:
+        return ex["ordered"]
+    sts = [s for s in split_sql(ex.get("check") or ex["sol"]) if not s.startswith(".")]
+    last = sts[-1] if sts else ""
+    depth, top = 0, ""
+    for ch in last:
+        depth += ch == "("
+        depth -= ch == ")"
+        top += ch if depth == 0 else " "
+    return bool(re.search(r"\bORDER\s+BY\b", top, re.I))
+
+
+def result_of(sec, ex, user_sql, tmpdir):
+    """Blocks to compare for a given answer (user or official)."""
+    db = Path(tmpdir) / f"work_{abs(hash(user_sql))}.db"
+    if ex["db"] == "scenario" and not ex["writes"]:
+        uri = f"file:{SCENARIO_SRC}?mode=ro"
+        con_path = uri
+        if ex.get("check"):
+            raise RuntimeError("bad exercise definition")
+        return run_py_uri(con_path, user_sql)
+    prepare(sec, ex, db)
+    if ex.get("check"):
+        ok, err = run_cli(db, user_sql)
+        if not ok:
+            return [("error", f"your script stopped with: {err}")], True
+        return run_py(db, ex["check"]), False
+    return run_py(db, user_sql), False
+
+
+def run_py_uri(uri, script):
+    con = sqlite3.connect(uri, uri=True)
+    blocks = []
+    for st in split_sql(script):
+        try:
+            cur = con.execute(st)
+            if cur.description:
+                blocks.append(("rows", [d[0] for d in cur.description], cur.fetchall()))
+        except sqlite3.Error as ex:
+            blocks.append(("error", str(ex)))
+    con.close()
+    return blocks, False
+
+
+def fmt_table(cols, rows, limit=MAX_SHOW):
+    def s(v):
+        return "NULL" if v is None else (f"{v:.2f}".rstrip("0").rstrip(".") if isinstance(v, float) else str(v))
+    shown = rows[:limit]
+    w = [len(c) for c in cols]
+    for r in shown:
+        for i, v in enumerate(r):
+            w[i] = max(w[i], len(s(v)))
+    line = lambda l, m, r_: l + m.join("─" * (x + 2) for x in w) + r_
+    out = [line("┌", "┬", "┐"), "│" + "│".join(f" {c:^{w[i]}} " for i, c in enumerate(cols)) + "│",
+           line("├", "┼", "┤")]
+    for r in shown:
+        cells = []
+        for i, v in enumerate(r):
+            t = s(v)
+            cells.append(f" {t:>{w[i]}} " if isinstance(v, (int, float)) else f" {t:<{w[i]}} ")
+        out.append("│" + "│".join(cells) + "│")
+    out.append(line("└", "┴", "┘"))
+    if len(rows) > limit:
+        out.append(f"... {len(rows)} rows total (first {limit} shown)")
+    elif not rows:
+        out.append("(no rows)")
+    return "\n".join(out)
+
+
+def fmt_blocks(blocks):
+    parts = []
+    for b in blocks:
+        if b[0] == "error":
+            parts.append(f"Error: {b[1]}")
+        else:
+            parts.append(fmt_table(b[1], b[2]))
+    return "\n\n".join(parts) if parts else "(no output)"
+
+
+# ------------------------------------------------------------------ commands
+def cmd_reset(args):
+    names = args or ["all"]
+    if names == ["all"]:
+        names = ["shop", "transit", "lab", "scenario"]
+    DBDIR.mkdir(exist_ok=True)
+    for n in names:
+        if n == "scenario" and not SCENARIO_SRC.exists():
+            print(f"{C['y']}skip scenario{C['0']}: {SCENARIO_SRC} not found")
+            continue
+        build_db(n, DBDIR / f"{n}.db")
+        print(f"{C['g']}reset{C['0']} db/{n}.db")
+
+
+def cmd_open(args):
+    n = args[0] if args else "shop"
+    p = DBDIR / f"{n}.db"
+    if not p.exists():
+        cmd_reset([n])
+    os.chdir(ROOT)
+    os.execvp("sqlite3", ["sqlite3", "-box", "-cmd", "PRAGMA foreign_keys = ON", str(p)])
+
+
+def cmd_list(args):
+    for s in load_sections():
+        if args and str(s["num"]) not in [a.lstrip("0") for a in args]:
+            continue
+        print(f"{C['b']}{s['num']:02d} {s['title']}{C['0']}  [{s['db']}]")
+        for e in s["ex"]:
+            tag = " (writes)" if e["writes"] else ""
+            print(f"   {e['id']}  {e['title']}{tag}")
+
+
+def cmd_show(args):
+    s, e = find(args[0])
+    print(f"{C['b']}{e['id']} {e['title']}{C['0']}   db: {e['db']}\n")
+    if e.get("concept"):
+        print(e["concept"].strip(), "\n")
+    print(f"{C['b']}Task:{C['0']}", e["task"].strip())
+    if e.get("hint"):
+        print(f"\n{C['y']}Hint:{C['0']} {e['hint'].strip()}")
+
+
+def cmd_solution(args):
+    s, e = find(args[0])
+    print(e["sol"].strip())
+
+
+def cmd_catchup(args):
+    s, e = find(args[0])
+    dest = DBDIR / f"{e['db']}.db"
+    DBDIR.mkdir(exist_ok=True)
+    prepare(s, e, dest)
+    print(f"{C['g']}db/{e['db']}.db{C['0']} is now in the state exercise {e['id']} expects")
+
+
+def cmd_check(args):
+    if len(args) < 1:
+        sys.exit("usage: ./drill check 03.04 answer.sql   (or '-' to read stdin)")
+    s, e = find(args[0])
+    if e.get("nocheck"):
+        print("This one is an observation exercise - compare with the expected output in the .md file.")
+        return
+    src = args[1] if len(args) > 1 else "-"
+    user = sys.stdin.read() if src == "-" else Path(src).read_text()
+    if not user.strip():
+        sys.exit("empty answer")
+    ordered = is_ordered(e)
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            exp, _ = result_of(s, e, e["sol"], td)
+            got, crashed = result_of(s, e, user, td)
+        except RuntimeError as ex:
+            sys.exit(str(ex))
+    if not e.get("check"):         # select exercise: compare last result set only
+        exp = [b for b in exp if b[0] == "rows"][-1:]
+        rows_blocks = [b for b in got if b[0] == "rows"]
+        errs = [b for b in got if b[0] == "error"]
+        if errs and not rows_blocks:
+            print(f"{C['r']}✗ error:{C['0']} {errs[-1][1]}")
+            return 1
+        got = rows_blocks[-1:]
+    if norm_blocks(got, ordered) == norm_blocks(exp, ordered):
+        print(f"{C['g']}✓ {e['id']} correct{C['0']}" + ("  (row order checked)" if ordered else ""))
+        return 0
+    print(f"{C['r']}✗ {e['id']} not quite.{C['0']}" + ("  (row order matters here)" if ordered else ""))
+    if crashed:
+        print(got[0][1])
+    else:
+        what = "your result" if not e.get("check") else "after your script, the check produced"
+        print(f"\n{C['b']}{what}:{C['0']}\n{fmt_blocks(got)}")
+        print(f"\n{C['b']}expected:{C['0']}\n{fmt_blocks(exp)}")
+        if e.get("check"):
+            print(f"\n{C['y']}check script used:{C['0']}\n{e['check'].strip()}")
+    return 1
+
+
+# ------------------------------------------------------------------ build markdown
+def cmd_build(args):
+    secs = load_sections()
+    outdir = ROOT / "exercises"
+    outdir.mkdir(exist_ok=True)
+    for old in outdir.glob("*.md"):
+        old.unlink()
+    total = 0
+    with tempfile.TemporaryDirectory() as td:
+        for s in secs:
+            md = [f"# {s['num']:02d} — {s['title']}\n",
+                  f"**Database:** `{s['db']}` · **Course link:** {s.get('pdf', '-')}\n",
+                  s.get("intro", "").strip() + "\n"]
+            for e in s["ex"]:
+                total += 1
+                try:
+                    blocks, _ = result_of(s, e, e["sol"], td)
+                except Exception as ex:  # noqa
+                    sys.exit(f"{e['id']} solution failed: {ex}")
+                errs = [b for b in blocks if b[0] == "error"]
+                if errs and not e.get("check") and not e.get("allow_error"):
+                    sys.exit(f"{e['id']} solution produced an error: {errs}")
+                if not e.get("check"):
+                    keep = ("rows", "error") if e.get("allow_error") else ("rows",)
+                    blocks = [b for b in blocks if b[0] in keep][-1:]
+                md.append(f"### {e['id']} — {e['title']}\n")
+                tags = []
+                if e["db"] != s["db"]:
+                    tags.append(f"db: `{e['db']}`")
+                if e["writes"]:
+                    tags.append("✏️ changes the DB — `./drill catchup " + e["id"] + "` first if your DB is out of sync")
+                if e.get("fresh"):
+                    tags.append("starts from a fresh DB (`./drill reset " + e["db"] + "`)")
+                if tags:
+                    md.append("_" + " · ".join(tags) + "_\n")
+                if e.get("concept"):
+                    md.append(f"**Concept:** {e['concept'].strip()}\n")
+                md.append(f"**Task:** {e['task'].strip()}\n")
+                if e.get("hint"):
+                    md.append(f"<details><summary>Hint</summary>\n\n{e['hint'].strip()}\n</details>\n")
+                label = "After your script, this check" if e.get("check") else "Expected result"
+                if e.get("check"):
+                    md.append(f"**{label}:**\n\n```sql\n{e['check'].strip()}\n```\n\nshould print:\n")
+                else:
+                    md.append(f"**{label}:**\n")
+                md.append("```text\n" + fmt_blocks(blocks) + "\n```\n")
+                if e.get("after"):
+                    md.append(f"> {e['after'].strip()}\n")
+                md.append("")
+            name = f"{s['num']:02d}_{s['file'].split('_', 1)[1]}.md"
+            (outdir / name).write_text("\n".join(md))
+            print(f"built exercises/{name} ({len(s['ex'])} exercises)")
+    print(f"{total} exercises")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, args = sys.argv[1], sys.argv[2:]
+    fn = globals().get(f"cmd_{cmd}")
+    if not fn:
+        sys.exit(f"unknown command {cmd!r}\n{__doc__}")
+    sys.exit(fn(args) or 0)
+
+
+if __name__ == "__main__":
+    main()
