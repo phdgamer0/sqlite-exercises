@@ -13,9 +13,10 @@ cd ~/Desktop/SqlStuff/Learning/drills
 ```
 Only needs `sqlite3` and `python3` (no pip packages).
 
-`db/` is not in the repo — it is rebuilt from `schemas/*.sql`. The `scenario` DB (133 MB, used only
-in section 11) is not included either: put it at `../scenario/scenario.db` or point to it with
-`SCENARIO_DB=/path/to/scenario.db ./reset.sh scenario`. Everything else works without it.
+`db/` is not in the repo — it is rebuilt from `schemas/`. The 127 MB `scenario` DB ships
+xz-compressed as `schemas/scenario.db.xz` (32 MB) and is unpacked automatically on first use.
+`scenario/` holds its schema and the Faker-based generator (`seed.py`) for reference.
+To grade against a different copy: `SCENARIO_DB=/path/to/scenario.db ./drill ...`.
 
 ## Workflow
 
@@ -51,7 +52,7 @@ How checks work:
 | `shop` | online store: categories (tree), products, customers (referral chain), employees (org chart), orders, order_items, payments, reviews. Money in kuruş. Deliberate edge cases: NULL cities/phones, duplicate names, never-sold products, underpaid orders, fake reviews | 01–05, 07–11 |
 | `transit` | SAMULAŞ-style cards / stations / swipes + fares, no triggers installed | 07, 10, 11 |
 | `lab` | empty — you design the tables | 06 |
-| `scenario` | copy of `../scenario/scenario.db` (universities, 600k students, 1.2M registrations) | 11 |
+| `scenario` | bundled `schemas/scenario.db.xz` (universities, 600k students, 1.2M registrations) | 11 |
 
 ## Sections ↔ lectures
 

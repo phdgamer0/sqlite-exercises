@@ -29,8 +29,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DBDIR = ROOT / "db"
-SCENARIO_SRC = Path(os.environ.get("SCENARIO_DB", ROOT.parent / "scenario" / "scenario.db"))
+SCENARIO_XZ = ROOT / "schemas" / "scenario.db.xz"
 CACHE = ROOT / "db" / ".cache"
+
+
+def scenario_src():
+    """Pristine scenario DB: $SCENARIO_DB if set, else schemas/scenario.db.xz unpacked once into the cache."""
+    if os.environ.get("SCENARIO_DB"):
+        p = Path(os.environ["SCENARIO_DB"])
+        if not p.exists():
+            sys.exit(f"SCENARIO_DB={p} does not exist")
+        return p
+    out = CACHE / "scenario.db"
+    if not out.exists() or out.stat().st_mtime < SCENARIO_XZ.stat().st_mtime:
+        import lzma
+        CACHE.mkdir(parents=True, exist_ok=True)
+        print("unpacking schemas/scenario.db.xz (once, ~10 s)...", file=sys.stderr)
+        tmp = out.with_suffix(".tmp")
+        with lzma.open(SCENARIO_XZ) as src, open(tmp, "wb") as dst:
+            shutil.copyfileobj(src, dst, 1 << 20)
+        tmp.replace(out)
+    return out
 MAX_SHOW = 12
 
 C = {"g": "\033[32m", "r": "\033[31m", "y": "\033[33m", "b": "\033[1m", "0": "\033[0m"} \
@@ -92,9 +111,7 @@ def build_db(name, path):
     elif name == "lab":
         sqlite3.connect(path).close()
     elif name == "scenario":
-        if not SCENARIO_SRC.exists():
-            sys.exit(f"scenario source DB not found at {SCENARIO_SRC} (set SCENARIO_DB=/path/to/scenario.db)")
-        shutil.copyfile(SCENARIO_SRC, path)
+        shutil.copyfile(scenario_src(), path)
     else:
         sys.exit(f"unknown db {name!r}")
 
@@ -201,7 +218,7 @@ def result_of(sec, ex, user_sql, tmpdir):
     """Blocks to compare for a given answer (user or official)."""
     db = Path(tmpdir) / f"work_{abs(hash(user_sql))}.db"
     if ex["db"] == "scenario" and not ex["writes"]:
-        uri = f"file:{SCENARIO_SRC}?mode=ro"
+        uri = f"file:{scenario_src()}?mode=ro"
         con_path = uri
         if ex.get("check"):
             raise RuntimeError("bad exercise definition")
@@ -271,9 +288,6 @@ def cmd_reset(args):
         names = ["shop", "transit", "lab", "scenario"]
     DBDIR.mkdir(exist_ok=True)
     for n in names:
-        if n == "scenario" and not SCENARIO_SRC.exists():
-            print(f"{C['y']}skip scenario{C['0']}: {SCENARIO_SRC} not found")
-            continue
         build_db(n, DBDIR / f"{n}.db")
         print(f"{C['g']}reset{C['0']} db/{n}.db")
 
